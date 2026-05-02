@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=VoiceJet
+Comment=VoiceJet dictation helper for JetBrains IDEs
+Exec={{PROJECT_DIR}}/.venv/bin/python {{PROJECT_DIR}}/voice_input.py
+Icon={{PROJECT_DIR}}/assets/voice-to-jetbrains.svg
+Path={{PROJECT_DIR}}
+Terminal=false
+Categories=Utility;Development;
+StartupNotify=false
