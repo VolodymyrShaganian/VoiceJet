@@ -36,20 +36,47 @@ def env_float(name, default):
         return default
 
 
+def env_bool(name, default):
+    value = os.getenv(name)
+    if value is None:
+        return default
+
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
 SAMPLE_RATE = env_int("SAMPLE_RATE", 16000)
 AUDIO_CHANNELS = env_int("AUDIO_CHANNELS", 1)
 FILENAME = os.getenv("AUDIO_FILENAME", "/tmp/voice_input.wav")
+TRANSCRIBE_PROVIDER = os.getenv("TRANSCRIBE_PROVIDER", "local").strip().lower()
 WHISPER_MODEL = os.getenv("WHISPER_MODEL", "small")
 WHISPER_DEVICE = os.getenv("WHISPER_DEVICE", "cpu")
 WHISPER_COMPUTE_TYPE = os.getenv("WHISPER_COMPUTE_TYPE", "int8")
 WHISPER_DOWNLOAD_ROOT = os.getenv("WHISPER_DOWNLOAD_ROOT") or None
 WHISPER_LANGUAGE = os.getenv("WHISPER_LANGUAGE", "uk")
 WHISPER_BEAM_SIZE = env_int("WHISPER_BEAM_SIZE", 1)
+OPENAI_TRANSCRIBE_MODEL = os.getenv("OPENAI_TRANSCRIBE_MODEL", "gpt-4o-transcribe")
+OPENAI_TRANSCRIBE_LANGUAGE = os.getenv("OPENAI_TRANSCRIBE_LANGUAGE", WHISPER_LANGUAGE)
+OPENAI_TRANSCRIBE_PROMPT = os.getenv("OPENAI_TRANSCRIBE_PROMPT", "")
+OPENAI_TRANSCRIBE_FALLBACK_LOCAL = env_bool("OPENAI_TRANSCRIBE_FALLBACK_LOCAL", True)
+OPENAI_COST_LOG = env_bool("OPENAI_COST_LOG", True)
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
 PASTE_DELAY = env_float("PASTE_DELAY", 0.1)
 HOTKEY_TOGGLE_RECORDING = os.getenv("HOTKEY_TOGGLE_RECORDING", "<f8>")
 HOTKEY_EXIT = os.getenv("HOTKEY_EXIT", "<ctrl>+<alt>+q")
 LOCK_FILE = os.getenv("LOCK_FILE", "/tmp/voicejet.lock")
+
+TRANSCRIBE_TOKEN_PRICES_PER_MILLION = {
+    "gpt-4o-transcribe": (2.50, 10.00),
+    "gpt-4o-mini-transcribe": (1.25, 5.00),
+    "gpt-4o-mini-transcribe-2025-12-15": (1.25, 5.00),
+    "gpt-4o-mini-transcribe-2025-03-20": (1.25, 5.00),
+}
+
+TRANSCRIBE_DURATION_PRICES_PER_MINUTE = {
+    "gpt-4o-transcribe": 0.006,
+    "gpt-4o-transcribe-diarize": 0.006,
+    "whisper-1": 0.006,
+}
 
 lock_handle = None
 model = None
@@ -79,6 +106,9 @@ def acquire_single_instance_lock():
 
 def load_whisper_model():
     global model
+
+    if model is not None:
+        return
 
     model = WhisperModel(
         WHISPER_MODEL,
@@ -329,16 +359,29 @@ def get_active_window_class():
 
 
 def paste_text(text):
-    pyperclip.copy(text)
-
     window_id = get_paste_window_id()
     if not window_id:
-        print("Не JetBrains вікно. Текст скопійовано.")
+        clear_clipboard()
+        print("Не JetBrains вікно. Вставку скасовано, буфер очищено.")
         return
 
-    activate_window(window_id)
-    time.sleep(PASTE_DELAY)
-    subprocess.run(["xdotool", "key", "--clearmodifiers", "ctrl+v"])
+    try:
+        pyperclip.copy(text)
+        if not activate_window(window_id):
+            print("Не вдалося активувати JetBrains вікно. Вставку скасовано, буфер очищено.")
+            return
+        time.sleep(PASTE_DELAY)
+        subprocess.run(["xdotool", "key", "--clearmodifiers", "ctrl+v"])
+    finally:
+        time.sleep(PASTE_DELAY)
+        clear_clipboard()
+
+
+def clear_clipboard():
+    try:
+        pyperclip.copy("")
+    except Exception as e:
+        print("Clipboard clear error:", e)
 
 
 def clean_text(text):
@@ -395,8 +438,68 @@ def process_with_gpt(text: str) -> str:
         return text
 
 
-def transcribe_and_paste():
-    print("Розпізнаю...")
+def get_transcribe_token_prices(model_name):
+    if model_name.startswith("gpt-4o-mini-transcribe"):
+        return TRANSCRIBE_TOKEN_PRICES_PER_MILLION["gpt-4o-mini-transcribe"]
+
+    if model_name.startswith("gpt-4o-transcribe"):
+        return TRANSCRIBE_TOKEN_PRICES_PER_MILLION["gpt-4o-transcribe"]
+
+    return TRANSCRIBE_TOKEN_PRICES_PER_MILLION.get(model_name)
+
+
+def usage_value(usage, name, default=None):
+    if isinstance(usage, dict):
+        return usage.get(name, default)
+
+    return getattr(usage, name, default)
+
+
+def estimate_transcription_cost(model_name, usage):
+    if usage is None:
+        return None
+
+    usage_type = usage_value(usage, "type")
+
+    if usage_type == "tokens":
+        prices = get_transcribe_token_prices(model_name)
+        if prices is None:
+            return None
+
+        input_tokens = usage_value(usage, "input_tokens", 0) or 0
+        output_tokens = usage_value(usage, "output_tokens", 0) or 0
+        input_price, output_price = prices
+        cost = (input_tokens / 1_000_000 * input_price) + (output_tokens / 1_000_000 * output_price)
+        details = f"{input_tokens} input tokens, {output_tokens} output tokens"
+        return cost, details
+
+    if usage_type == "duration":
+        price_per_minute = TRANSCRIBE_DURATION_PRICES_PER_MINUTE.get(model_name)
+        if price_per_minute is None:
+            return None
+
+        seconds = usage_value(usage, "seconds", 0) or 0
+        cost = seconds / 60 * price_per_minute
+        details = f"{seconds:.1f} seconds"
+        return cost, details
+
+    return None
+
+
+def print_transcription_cost(model_name, usage):
+    if not OPENAI_COST_LOG:
+        return
+
+    estimate = estimate_transcription_cost(model_name, usage)
+    if estimate is None:
+        return
+
+    cost, details = estimate
+    print(f"OpenAI transcribe cost estimate: ${cost:.6f} ({details})")
+
+
+def transcribe_with_local_whisper():
+    load_whisper_model()
 
     segments, info = model.transcribe(
         FILENAME,
@@ -404,7 +507,57 @@ def transcribe_and_paste():
         beam_size=WHISPER_BEAM_SIZE
     )
 
-    text = " ".join(segment.text.strip() for segment in segments).strip()
+    return " ".join(segment.text.strip() for segment in segments).strip()
+
+
+def transcribe_with_openai():
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        raise RuntimeError("OPENAI_API_KEY is required for OpenAI transcription.")
+
+    client = OpenAI(api_key=api_key)
+    params = {
+        "model": OPENAI_TRANSCRIBE_MODEL,
+        "response_format": "json",
+    }
+
+    if OPENAI_TRANSCRIBE_LANGUAGE:
+        params["language"] = OPENAI_TRANSCRIBE_LANGUAGE
+
+    if OPENAI_TRANSCRIBE_PROMPT and OPENAI_TRANSCRIBE_MODEL != "gpt-4o-transcribe-diarize":
+        params["prompt"] = OPENAI_TRANSCRIBE_PROMPT
+
+    if OPENAI_TRANSCRIBE_MODEL == "gpt-4o-transcribe-diarize":
+        params["chunking_strategy"] = "auto"
+
+    with open(FILENAME, "rb") as audio_file:
+        response = client.audio.transcriptions.create(file=audio_file, **params)
+
+    print_transcription_cost(OPENAI_TRANSCRIBE_MODEL, getattr(response, "usage", None))
+    return getattr(response, "text", "").strip()
+
+
+def transcribe_audio():
+    if TRANSCRIBE_PROVIDER == "openai":
+        try:
+            return transcribe_with_openai()
+        except Exception as e:
+            print("OpenAI transcription error:", e)
+            if OPENAI_TRANSCRIBE_FALLBACK_LOCAL:
+                print("Переходжу на локальний Whisper fallback...")
+                return transcribe_with_local_whisper()
+            return ""
+
+    if TRANSCRIBE_PROVIDER != "local":
+        print(f"Unknown TRANSCRIBE_PROVIDER={TRANSCRIBE_PROVIDER!r}. Using local Whisper.")
+
+    return transcribe_with_local_whisper()
+
+
+def transcribe_and_paste():
+    print("Розпізнаю...")
+
+    text = transcribe_audio()
     text = clean_text(text)
     text = process_with_gpt(text)
 
@@ -475,7 +628,16 @@ def main():
     if not acquire_single_instance_lock():
         return
 
-    load_whisper_model()
+    if TRANSCRIBE_PROVIDER == "local":
+        print(f"Transcriber: local Whisper ({WHISPER_MODEL})")
+        load_whisper_model()
+    elif TRANSCRIBE_PROVIDER == "openai":
+        print(f"Transcriber: OpenAI ({OPENAI_TRANSCRIBE_MODEL})")
+        if OPENAI_TRANSCRIBE_FALLBACK_LOCAL:
+            print(f"Fallback: local Whisper ({WHISPER_MODEL})")
+    else:
+        print(f"Unknown TRANSCRIBE_PROVIDER={TRANSCRIBE_PROVIDER!r}. Loading local Whisper.")
+        load_whisper_model()
 
     hotkey = keyboard.GlobalHotKeys({
         HOTKEY_TOGGLE_RECORDING: on_activate,

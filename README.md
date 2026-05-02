@@ -52,6 +52,13 @@ All main runtime settings are configured through `.env`:
 ```env
 OPENAI_MODEL=gpt-4.1-mini
 
+TRANSCRIBE_PROVIDER=local
+OPENAI_TRANSCRIBE_MODEL=gpt-4o-transcribe
+OPENAI_TRANSCRIBE_LANGUAGE=uk
+OPENAI_TRANSCRIBE_PROMPT=
+OPENAI_TRANSCRIBE_FALLBACK_LOCAL=true
+OPENAI_COST_LOG=true
+
 WHISPER_MODEL=small
 WHISPER_DEVICE=cpu
 WHISPER_COMPUTE_TYPE=int8
@@ -70,6 +77,27 @@ HOTKEY_EXIT=<ctrl>+<alt>+q
 LOCK_FILE=/tmp/voicejet.lock
 ```
 
+Configuration is read when the app process starts. After changing `.env` or shell environment variables, fully quit VoiceJet and start it again. No rebuild is needed.
+
+Transcription can run locally with Whisper or through OpenAI:
+
+```env
+TRANSCRIBE_PROVIDER=local
+```
+
+```env
+TRANSCRIBE_PROVIDER=openai
+OPENAI_TRANSCRIBE_MODEL=gpt-4o-transcribe
+```
+
+For a cheaper OpenAI transcription model, use:
+
+```env
+OPENAI_TRANSCRIBE_MODEL=gpt-4o-mini-transcribe
+```
+
+When `TRANSCRIBE_PROVIDER=openai`, the local Whisper model is not loaded at startup. If OpenAI transcription fails and `OPENAI_TRANSCRIBE_FALLBACK_LOCAL=true`, the app falls back to local Whisper. `OPENAI_COST_LOG=true` prints an estimated OpenAI transcription cost after each successful OpenAI transcription when usage data is returned by the API.
+
 Hotkey syntax follows `pynput` global hotkey format. Examples:
 
 ```env
@@ -84,7 +112,7 @@ HOTKEY_EXIT=<ctrl>+<shift>+q
 
 ## Whisper Models
 
-Whisper models trade speed for recognition quality:
+These settings are used when `TRANSCRIBE_PROVIDER=local`, or when OpenAI transcription falls back to local Whisper. Whisper models trade speed for recognition quality:
 
 ```text
 tiny    fastest, lowest quality; good for very short commands
@@ -178,10 +206,12 @@ WebStorm
 jetbrains
 ```
 
-If another window is active, the text is copied to the clipboard and this message is printed:
+Pasting uses the clipboard temporarily and clears it immediately after the paste attempt.
+
+If another window is active, paste is canceled, the clipboard is cleared, and this message is printed:
 
 ```text
-Не JetBrains вікно. Текст скопійовано.
+Не JetBrains вікно. Вставку скасовано, буфер очищено.
 ```
 
 ## Notes
